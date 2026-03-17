@@ -3,95 +3,131 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
+import re
 
-st.set_page_config(layout="wide", page_title="Mtrol Precision Sync")
+# 1. Page Config
+st.set_page_config(page_title="Mtrol Precision Analytics", layout="wide")
 
-# --- DATA CONSTANTS ---
-PPM_DATA = {
-    "Mtrol 3": {"Flow Rate": None, "% Opening": 2449.99, "P1": 21455.76, "P2": 20355.54},
-    "Mtrol 4": {"Flow Rate": None, "% Opening": 2170.41, "P1": 129.91, "P2": 310.21}
+# --- SIDEBAR LOGO ---
+if os.path.exists("logo.png"):
+    st.sidebar.image("logo.png", use_container_width=True)
+
+# --- HARDCODED STANDARDS (From your specs) ---
+MT3_VALS = {
+    "flow": {"ref_range": 200.0, "ppm": None, "unit": "Kg/Hr"},
+    "opening": {"ref_range": 100.0, "ppm": 2449.99, "unit": "%"},
+    "p1": {"ref_range": 17.0, "ppm": 21455.76, "unit": "bar"},
+    "p2": {"ref_range": 17.0, "ppm": 20355.54, "unit": "bar"}
 }
 
-# --- STYLING ---
-st.markdown("""
-    <style>
-    [data-testid="stMetricValue"] { font-size: 24px !important; color: #00CCFF !important; }
-    [data-testid="stMetricLabel"] { font-size: 16px !important; font-weight: bold !important; }
-    </style>
-    """, unsafe_allow_html=True)
+MT4_VALS = {
+    "flow": {"ref_range": 500.0, "ppm": None, "unit": "Kg/Hr"},
+    "opening": {"ref_range": 100.0, "ppm": 2170.41, "unit": "%"},
+    "p1": {"ref_range": 17.0, "ppm": 129.91, "unit": "bar"},
+    "p2": {"ref_range": 17.0, "ppm": 310.21, "unit": "bar"}
+}
 
-# --- HEADER ---
-h_col1, h_col2 = st.columns([4, 1])
-with h_col1:
-    st.title("Mtrol Full-Cycle Analysis")
-    st.write("### 1s Synchronized Original Data")
-with h_col2:
-    if os.path.exists("logo.png"):
-        st.image("logo.png", use_container_width=True)
+TEMP_DELTA_FIXED = 89.85
 
-# --- UPLOADERS ---
-st.sidebar.header("📁 Data Upload")
-device_file = st.sidebar.file_uploader("1. Upload Device Data (Original)", type=['csv'])
-temp_file = st.sidebar.file_uploader("2. Upload Chamber_temp_data", type=['csv'])
-
+# --- DATA CLEANING & SYNC ---
 @st.cache_data
-def load_and_clean(dev_file, temp_file):
-    df_dev = pd.read_csv(dev_file)
-    df_dev['Time Stamp'] = pd.to_datetime(df_dev['Time Stamp'])
+def load_and_sync_data(dev_upload, temp_upload):
+    # Load Device Data
+    df_dev = pd.read_csv(dev_upload)
+    time_col = next((c for c in df_dev.columns if "time" in c.lower()), "Time Stamp")
+    df_dev[time_col] = pd.to_datetime(df_dev[time_col], errors='coerce')
     
-    # CRITICAL: Clean non-numeric values like '**' or 'Message'
-    for col in ["P1", "P2", "Flow Rate", "% Opening"]:
-        if col in df_dev.columns:
-            df_dev[col] = pd.to_numeric(df_dev[col], errors='coerce')
+    # Clean non-numeric characters (**, Message, etc.)
+    targets = ["P1", "P2", "Flow Rate", "% Opening"]
+    for col in df_dev.columns:
+        if any(t.lower() in col.lower() for t in targets):
+            df_dev[col] = pd.to_numeric(df_dev[col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
     
-    df_temp = pd.read_csv(temp_file).dropna(subset=['Timestamp'])
+    # Load Temp Data
+    df_temp = pd.read_csv(temp_upload).dropna(subset=['Timestamp'])
     df_temp['Timestamp'] = pd.to_datetime(df_temp['Timestamp'])
     
-    df_dev = df_dev.set_index('Time Stamp').sort_index()
+    # Sync Indices
+    df_dev = df_dev.set_index(time_col).sort_index()
     df_temp = df_temp.set_index('Timestamp').sort_index()
     
     combined = pd.concat([df_dev, df_temp], axis=1)
-    # Sync: Guess temp for every second between 2-minute samples
     combined['Temperature (°C)(Temp)'] = combined['Temperature (°C)(Temp)'].interpolate(method='time')
     
     return combined.loc[df_dev.index[0] : df_dev.index[-1]].reset_index().rename(columns={'index': 'Full_Time'})
 
+# --- MAIN UI ---
+st.title("Mtrol Full-Cycle Stability Dashboard")
+
+st.sidebar.header("📁 Data Upload")
+device_file = st.sidebar.file_uploader("1. Upload Device CSV", type=['csv'])
+temp_file = st.sidebar.file_uploader("2. Upload Chamber_temp_data CSV", type=['csv'])
+
+st.sidebar.header("Analysis Settings")
+smooth_data = st.sidebar.toggle("Enable Signal Smoothing", value=True)
+window_size = st.sidebar.slider("Smoothing Window (sec)", 5, 100, 20) if smooth_data else 1
+
 if device_file and temp_file:
-    device_type = "Mtrol 4" if "MT4" in device_file.name.upper() or "MTROL 4" in device_file.name.upper() else "Mtrol 3"
-    df = load_and_clean(device_file, temp_file)
+    df = load_and_sync_data(device_file, temp_file)
+    device_mode = "Mtrol 4" if "MT4" in device_file.name.upper() or "MTROL 4" in device_file.name.upper() else "Mtrol 3"
+    data_lookup = MT4_VALS if device_mode == "Mtrol 4" else MT3_VALS
     
-    selected = st.sidebar.selectbox("🎯 Select Parameter", ["P1", "P2", "Flow Rate", "% Opening"])
+    available_params = [c for c in df.columns if any(t in c.lower() for t in ["flow", "opening", "p1", "p2"])]
+    
+    if available_params:
+        selected_param = st.sidebar.selectbox("🎯 Select Parameter", available_params)
+        clean_key = next((k for k in ["flow", "opening", "p1", "p2"] if k in selected_param.lower()), "p1")
+        
+        # Get standards
+        ref_range = data_lookup[clean_key]["ref_range"]
+        target_ppm = data_lookup[clean_key]["ppm"]
+        unit = data_lookup[clean_key]["unit"]
 
-    # --- METRICS ---
-    st.write("---")
-    m1, m2, m3, m4 = st.columns(4)
-    v_max, v_min = df[selected].max(), df[selected].min()
-    v_ppm = PPM_DATA[device_type].get(selected, "—")
-    unit = "bar" if "P" in selected else ("Kg/Hr" if "Flow" in selected else "%")
+        # --- CALCULATIONS ---
+        raw_series = df[selected_param]
+        clean_series = raw_series.rolling(window=window_size, center=True).mean() if smooth_data else raw_series
+        
+        c_max = clean_series.expanding().max()
+        c_min = clean_series.expanding().min()
+        drift = c_max - c_min
+        df['PPM_Stability'] = (drift * 1000000) / (TEMP_DELTA_FIXED * ref_range)
 
-    m1.metric("Device Identified", device_type)
-    m2.metric(f"MAX {selected}", f"{v_max:.2f} {unit}" if pd.notnull(v_max) else "N/A")
-    m3.metric(f"MIN {selected}", f"{v_min:.2f} {unit}" if pd.notnull(v_min) else "N/A")
-    m4.metric("PPM Target", f"{v_ppm}")
-    st.write("---")
+        # --- METRICS ---
+        st.subheader(f"📊 {selected_param} Performance ({device_mode})")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Current Stability", f"{df['PPM_Stability'].iloc[-1]:.2f} PPM")
+        m2.metric("Max Drift", f"{drift.max():.4f} {unit}")
+        m3.metric("Reference Scale", f"{ref_range} {unit}")
+        m4.metric("Target PPM", f"{target_ppm}" if target_ppm else "N/A")
 
-    # --- SCALING ---
-    if "flow" in selected.lower(): l_range, l_dtick = [0, 320], 40
-    elif "p" in selected.lower(): l_range, l_dtick = [0, 20], 2
-    else: l_range, l_dtick = [-20, 70], 10
+        # --- GRAPH ---
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        fig.add_trace(go.Scattergl(
+            x=df['Full_Time'], y=df['PPM_Stability'], 
+            name="Stability (PPM)", line=dict(color="#00CCFF", width=2)
+        ), secondary_y=False)
 
-    # --- PLOT ---
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scattergl(x=df['Full_Time'], y=df[selected], name=selected, line=dict(color="#00CCFF")), secondary_y=False)
-    fig.add_trace(go.Scattergl(x=df['Full_Time'], y=df['Temperature (°C)(Temp)'], name="Chamber Temp", line=dict(color="#FFD700", dash='dot')), secondary_y=True)
+        fig.add_trace(go.Scattergl(
+            x=df['Full_Time'], y=df['Temperature (°C)(Temp)'], 
+            name="Chamber Temp", line=dict(color="#FFD700", dash='dot')
+        ), secondary_y=True)
 
-    fig.update_layout(
-        template="plotly_dark", height=650, hovermode="x unified", dragmode="zoom",
-        xaxis=dict(title="Time", rangeslider=dict(visible=True), showspikes=True, spikemode="across"),
-        yaxis=dict(title=f"<b>{selected} ({unit})</b>", range=l_range, dtick=l_dtick, fixedrange=False),
-        yaxis2=dict(title="<b>Chamber Temp (°C)</b>", range=[-20, 70], dtick=10, fixedrange=False),
-        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center")
-    )
-    st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+        fig.update_layout(
+            template="plotly_dark", height=600,
+            hovermode="x unified", dragmode="zoom",
+            xaxis=dict(title="Time Progress", rangeslider=dict(visible=True, thickness=0.05)),
+            yaxis=dict(title="<b>Stability (PPM)</b>", color="#00CCFF", fixedrange=False),
+            yaxis2=dict(title="<b>Temp (°C)</b>", color="#FFD700", side='right', fixedrange=False),
+            legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center")
+        )
+
+        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+
+        # --- MATH BREAKDOWN ---
+        with st.expander("🔍 View PPM Calculation"):
+            st.latex(rf"PPM = \frac{{({c_max.max():.4f} - {c_min.min():.4f}) \times 1,000,000}}{{89.85 \times {ref_range}}}")
+            st.write(f"**Final Result:** {df['PPM_Stability'].iloc[-1]:.2f} PPM")
+
 else:
-    st.info("👈 Upload your Original Device CSV and Chamber_temp_data CSV to begin.")
+    st.info("Upload Device and Chamber CSVs to begin.")
